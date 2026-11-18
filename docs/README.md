@@ -10,6 +10,7 @@ Any contribution to improving this documentation or adding sample usages will be
 * [Exposed Metrics](#exposed-metrics)
 * [PromQL Queries](#promql-queries)
 * [Join Metrics](#join-metrics)
+* [Label Mapping, Conflicts, and Duplicate Series](#label-mapping-conflicts-and-duplicate-series)
 * [CLI arguments](#cli-arguments)
 
 ## Metrics Stages
@@ -108,6 +109,16 @@ sum(kube_pod_container_resource_requests{resource="memory"}) by (namespace, pod,
 > `custom-resource-state` is feature-frozen in favor of [resource-state-metrics](https://github.com/kubernetes-sigs/resource-state-metrics). Once `resource-state-metrics` is stable, `custom-resource-state` will be deprecated.
 
 See [Custom Resource State Metrics](metrics/extend/customresourcestate-metrics.md) for experimental support for custom resources.
+
+## Label Mapping, Conflicts, and Duplicate Series
+
+Kubernetes labels and annotations selected via `--metric-labels-allowlist` and `--metric-annotations-allowlist` are exposed as Prometheus labels on the `kube_<resource>_labels` / `kube_<resource>_annotations` metrics. The mapping from a Kubernetes key to a Prometheus label name replaces every character outside `[a-zA-Z0-9_]` with `_` and converts camelCase to snake_case (e.g. the label `example.com/teamName` becomes `label_example_com_team_name`).
+
+**Label conflicts.** Two different Kubernetes keys can map to the same Prometheus label name (e.g. `team.name` and `team_name` both become `label_team_name`). Since Prometheus rejects a sample carrying the same label name twice, the colliding labels are renamed with a conflict suffix: the keys are processed in sorted order and emitted as `label_team_name_conflict1`, `label_team_name_conflict2`, and so on. The conflict suffix is also skipped if a Kubernetes key sanitizes directly onto it.
+
+**Missing fields.** Objects are tracked by `metadata.uid`. An object event with a missing UID falls back to the `namespace/name` identity, so UID-less objects neither overwrite each other nor get removed by an unrelated delete.
+
+**Duplicate series.** If the same time series (metric name and label set) would be emitted more than once in a single scrape — for example when a missed delete leaves a stale entry next to the re-created object, when missing fields collapse the label sets of two objects, or when a label conflict resolves to identical output — only the first occurrence is written. The series identity excludes the sample value, so a stale entry with an older value (such as a resource version) is still treated as a duplicate. This deduplication happens in the metrics store rather than at collection time: the store is the single choke point for all metrics consumers, and doing it there keeps metric names, label sets, and the exposition format unchanged. A duplicate series would otherwise fail the entire Prometheus scrape.
 
 ## CLI Arguments
 

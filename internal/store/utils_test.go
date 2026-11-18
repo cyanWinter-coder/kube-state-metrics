@@ -265,6 +265,22 @@ func TestKubeLabelsToPrometheusLabels(t *testing.T) {
 				"dot",
 			},
 		},
+		{
+			// Keys that carry no valid label character at all still sanitize
+			// (to "_") and still collide with each other.
+			kubeLabels: map[string]string{
+				"-": "hyphen",
+				".": "dot",
+			},
+			expectKeys: []string{
+				"label___conflict1",
+				"label___conflict2",
+			},
+			expectValues: []string{
+				"hyphen",
+				"dot",
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -491,6 +507,19 @@ func TestCreatePrometheusLabelKeysValues(t *testing.T) {
 			allowList:    []string{"*key*"},
 			expectKeys:   []string{},
 			expectValues: []string{},
+		},
+		{
+			// A wildcard that admits two keys sanitizing to the same Prometheus
+			// label name must still go through conflict resolution, so the
+			// emitted series carries no duplicate label name.
+			name: "wildcardSelectsConflictingLabels",
+			kubeData: map[string]string{
+				"conflicting.label": "dot",
+				"conflicting_label": "underscore",
+			},
+			allowList:    []string{"conflicting*"},
+			expectKeys:   []string{"metric_conflicting_label_conflict1", "metric_conflicting_label_conflict2"},
+			expectValues: []string{"dot", "underscore"},
 		},
 	}
 

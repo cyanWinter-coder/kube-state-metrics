@@ -20,6 +20,7 @@ import (
 	"sync"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
@@ -113,12 +114,12 @@ func (s *MetricsStore) Add(obj any) error {
 
 	families := s.generateMetricsFunc(obj)
 
-	s.metrics.Store(o.GetUID(), renderFamilies(families))
+	s.metrics.Store(storeKey(o), renderFamilies(families))
 
 	return nil
 }
 
-// objectUID returns the UID an object is stored under.
+// objectUID returns the key an object is stored under.
 func objectUID(obj any) (types.UID, error) {
 	if r, ok := obj.(*renderedObject); ok {
 		return r.uid, nil
@@ -127,7 +128,22 @@ func objectUID(obj any) (types.UID, error) {
 	if err != nil {
 		return "", err
 	}
-	return o.GetUID(), nil
+	return storeKey(o), nil
+}
+
+// storeKey returns the key an object is stored under. The UID identifies an
+// object uniquely, but an object with a missing UID (a delete event for an
+// object that never got one assigned, or a synthetic object) would collapse
+// onto the empty key together with every other UID-less object: they would
+// overwrite each other on Add, and a Delete for one would drop the metrics of
+// all. Fall back to namespace/name, which is unique among the live objects of
+// a resource, so a missing UID degrades to keying by identity instead of
+// keying by nothing.
+func storeKey(o metav1.Object) types.UID {
+	if uid := o.GetUID(); uid != "" {
+		return uid
+	}
+	return types.UID(o.GetNamespace() + "/" + o.GetName())
 }
 
 // byteAppender is implemented by families that can render themselves into a
@@ -198,7 +214,7 @@ func (s *MetricsStore) Delete(obj any) error {
 
 	s.setLastResourceVersion(o.GetResourceVersion())
 
-	s.metrics.Delete(o.GetUID())
+	s.metrics.Delete(storeKey(o))
 
 	return nil
 }
@@ -281,7 +297,7 @@ func (s *MetricsStore) Transformer() cache.TransformFunc {
 			return obj, nil
 		}
 		return &renderedObject{
-			uid:      o.GetUID(),
+			uid:      storeKey(o),
 			families: renderFamilies(s.generateMetricsFunc(obj)),
 		}, nil
 	}

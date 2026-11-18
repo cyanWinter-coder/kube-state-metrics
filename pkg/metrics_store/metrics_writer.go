@@ -17,6 +17,7 @@ limitations under the License.
 package metricsstore
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"strings"
@@ -44,6 +45,15 @@ var (
 	seenPool = sync.Pool{
 		New: func() any {
 			return make(map[string]struct{})
+		},
+	}
+
+	// seenSeriesPool holds the series-identity sets WriteAll uses to suppress
+	// duplicate time series. Keyed by a 64-bit FNV-1a hash of the series
+	// identity (metric name and label set, without the value).
+	seenSeriesPool = sync.Pool{
+		New: func() any {
+			return make(map[uint64]struct{})
 		},
 	}
 )
@@ -96,6 +106,24 @@ func (m MetricsWriter) WriteAll(w io.Writer) error {
 		}
 	}
 
+	// Duplicate time series are suppressed here, in the store layer, rather
+	// than in the collector (the /metrics handler): this is the single choke
+	// point every consumer of a MetricsWriterList goes through, and the store
+	// still has the family boundaries a collector would have to re-parse out
+	// of rendered text. A duplicate series fails the whole Prometheus scrape,
+	// while a suppressed duplicate only hides a series that is rendered
+	// identically (a stale entry left behind by a missed delete next to its
+	// re-added object, two objects whose missing fields collapse their label
+	// sets, or a label conflict resolved to the same name) or with a stale
+	// value. The first occurrence written wins; metric names and label sets
+	// are emitted unchanged.
+	seenSeries := seenSeriesPool.Get().(map[uint64]struct{})
+	defer func() {
+		clear(seenSeries)
+		seenSeriesPool.Put(seenSeries)
+	}()
+	var dedupBuf []byte
+
 	for i, help := range m.stores[0].headers {
 		var err error
 
@@ -121,7 +149,11 @@ func (m MetricsWriter) WriteAll(w io.Writer) error {
 		for _, s := range m.stores {
 			s.metrics.Range(func(_ any, value any) bool {
 				metricFamilies := value.([][]byte)
-				_, err = w.Write(metricFamilies[i])
+				dedupBuf = appendUnduplicatedSeries(dedupBuf[:0], metricFamilies[i], seenSeries)
+				if len(dedupBuf) == 0 {
+					return true
+				}
+				_, err = w.Write(dedupBuf)
 				if err != nil {
 					err = fmt.Errorf("failed to write metrics family: %w", err)
 					return false
@@ -134,6 +166,58 @@ func (m MetricsWriter) WriteAll(w io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// appendUnduplicatedSeries appends the series of a rendered family blob to
+// dst, skipping any series whose identity was already seen during this
+// WriteAll call. A series identity is the metric name and label set — the
+// line up to the last space, which excludes the value — so a stale entry
+// rendering the same labels with an older value (e.g. a resource version) is
+// still a duplicate. The blob is the output of metric.Family.AppendBytes: one
+// newline-terminated series per line, each starting with the metric name, so
+// identities cannot collide across families.
+func appendUnduplicatedSeries(dst, blob []byte, seen map[uint64]struct{}) []byte {
+	for len(blob) > 0 {
+		line := blob
+		if nl := bytes.IndexByte(blob, '\n'); nl >= 0 {
+			line = blob[:nl]
+			blob = blob[nl+1:]
+		} else {
+			blob = nil
+		}
+		if len(line) == 0 {
+			continue
+		}
+		identity := line
+		if sp := bytes.LastIndexByte(line, ' '); sp >= 0 {
+			identity = line[:sp]
+		}
+		h := fnv64a(identity)
+		if _, dup := seen[h]; dup {
+			continue
+		}
+		seen[h] = struct{}{}
+		dst = append(dst, line...)
+		dst = append(dst, '\n')
+	}
+	return dst
+}
+
+// fnv64a is the 64-bit FNV-1a hash, inlined to avoid the allocation
+// hash/fnv.New64a would cost per call. 64 bits keeps the chance of an
+// accidental collision between distinct series negligible at any realistic
+// series count.
+func fnv64a(b []byte) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for _, c := range b {
+		h ^= uint64(c)
+		h *= prime64
+	}
+	return h
 }
 
 // parseHeaderStatic parses and potentially rewrites a header string.

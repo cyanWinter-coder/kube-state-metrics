@@ -19,6 +19,7 @@ package metricsstore
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -31,6 +32,150 @@ import (
 
 	"k8s.io/kube-state-metrics/v2/pkg/metric"
 )
+
+// A stale entry left behind by a missed delete renders the same series as the
+// re-added object. WriteAll must emit the series only once: a duplicate time
+// series would fail the whole Prometheus scrape.
+func TestWriteAllDeduplicatesStaleEntries(t *testing.T) {
+	genFunc := func(obj any) []metric.FamilyInterface {
+		o, err := meta.Accessor(obj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []metric.FamilyInterface{&metric.Family{
+			Name: "kube_test_info",
+			Metrics: []*metric.Metric{{
+				LabelKeys:   []string{"namespace", "name"},
+				LabelValues: []string{o.GetNamespace(), o.GetName()},
+				Value:       1,
+			}},
+		}}
+	}
+	store := NewMetricsStore([]string{"# HELP kube_test_info info\n# TYPE kube_test_info gauge"}, genFunc)
+
+	// The delete for uid-old never arrived, so the stale entry sits next to
+	// the re-added object and both render the same series.
+	if err := store.Add(&v1.Service{UID: "uid-old", Name: "svc", Namespace: "ns"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(&v1.Service{UID: "uid-new", Name: "svc", Namespace: "ns"}); err != nil {
+		t.Fatal(err)
+	}
+
+	w := strings.Builder{}
+	if err := NewMetricsWriter("test", store).WriteAll(&w); err != nil {
+		t.Fatalf("failed to write metrics: %v", err)
+	}
+	if n := strings.Count(w.String(), "kube_test_info{"); n != 1 {
+		t.Fatalf("expected the duplicated series to be written once, got %d occurrences in %q", n, w.String())
+	}
+}
+
+// The series identity excludes the value: a stale entry rendering the same
+// labels with an older value (e.g. a resource version) is still a duplicate.
+func TestWriteAllDeduplicatesSeriesWithDifferentValues(t *testing.T) {
+	genFunc := func(obj any) []metric.FamilyInterface {
+		o, err := meta.Accessor(obj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rv, err := strconv.ParseFloat(o.GetResourceVersion(), 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []metric.FamilyInterface{&metric.Family{
+			Name: "kube_test_resource_version",
+			Metrics: []*metric.Metric{{
+				LabelKeys:   []string{"namespace", "name"},
+				LabelValues: []string{o.GetNamespace(), o.GetName()},
+				Value:       rv,
+			}},
+		}}
+	}
+	store := NewMetricsStore([]string{"# HELP kube_test_resource_version rv\n# TYPE kube_test_resource_version gauge"}, genFunc)
+
+	if err := store.Add(&v1.Service{UID: "uid-old", Name: "svc", Namespace: "ns", ResourceVersion: "5"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(&v1.Service{UID: "uid-new", Name: "svc", Namespace: "ns", ResourceVersion: "7"}); err != nil {
+		t.Fatal(err)
+	}
+
+	w := strings.Builder{}
+	if err := NewMetricsWriter("test", store).WriteAll(&w); err != nil {
+		t.Fatalf("failed to write metrics: %v", err)
+	}
+	if n := strings.Count(w.String(), "kube_test_resource_version{"); n != 1 {
+		t.Fatalf("expected the series to be written once despite differing values, got %d occurrences in %q", n, w.String())
+	}
+}
+
+// Two identical metrics inside a single object's family — e.g. a label
+// conflict resolved to identical label sets — collapse into one series.
+func TestWriteAllDeduplicatesWithinSingleObjectFamily(t *testing.T) {
+	genFunc := func(_ any) []metric.FamilyInterface {
+		duplicate := func() *metric.Metric {
+			return &metric.Metric{
+				LabelKeys:   []string{"namespace", "name"},
+				LabelValues: []string{"ns", "svc"},
+				Value:       1,
+			}
+		}
+		return []metric.FamilyInterface{&metric.Family{
+			Name:    "kube_test_info",
+			Metrics: []*metric.Metric{duplicate(), duplicate()},
+		}}
+	}
+	store := NewMetricsStore([]string{"# HELP kube_test_info info\n# TYPE kube_test_info gauge"}, genFunc)
+	if err := store.Add(&v1.Service{UID: "uid-1", Name: "svc", Namespace: "ns"}); err != nil {
+		t.Fatal(err)
+	}
+
+	w := strings.Builder{}
+	if err := NewMetricsWriter("test", store).WriteAll(&w); err != nil {
+		t.Fatalf("failed to write metrics: %v", err)
+	}
+	if n := strings.Count(w.String(), "kube_test_info{"); n != 1 {
+		t.Fatalf("expected identical metrics of one object to be written once, got %d occurrences in %q", n, w.String())
+	}
+}
+
+// Deduplication must not drop distinct series: same metric name with
+// different label values are different time series.
+func TestWriteAllKeepsDistinctSeries(t *testing.T) {
+	genFunc := func(obj any) []metric.FamilyInterface {
+		o, err := meta.Accessor(obj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []metric.FamilyInterface{&metric.Family{
+			Name: "kube_test_info",
+			Metrics: []*metric.Metric{{
+				LabelKeys:   []string{"namespace", "name"},
+				LabelValues: []string{o.GetNamespace(), o.GetName()},
+				Value:       1,
+			}},
+		}}
+	}
+	store := NewMetricsStore([]string{"# HELP kube_test_info info\n# TYPE kube_test_info gauge"}, genFunc)
+	for _, svc := range []v1.Service{
+		{UID: "uid-1", Name: "svc-a", Namespace: "ns"},
+		{UID: "uid-2", Name: "svc-b", Namespace: "ns"},
+	} {
+		svc := svc
+		if err := store.Add(&svc); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	w := strings.Builder{}
+	if err := NewMetricsWriter("test", store).WriteAll(&w); err != nil {
+		t.Fatalf("failed to write metrics: %v", err)
+	}
+	if n := strings.Count(w.String(), "kube_test_info{"); n != 2 {
+		t.Fatalf("expected both distinct series to be written, got %d occurrences in %q", n, w.String())
+	}
+}
 
 func TestWriteAllWithSingleStore(t *testing.T) {
 	genFunc := func(obj any) []metric.FamilyInterface {

@@ -93,6 +93,125 @@ func TestObjectsSameNameDifferentNamespaces(t *testing.T) {
 	}
 }
 
+// Objects without a UID fall back to a namespace/name store key, so they
+// neither overwrite each other nor wipe each other out on delete.
+func TestStoreKeyFallsBackToNamespaceNameWhenUIDMissing(t *testing.T) {
+	genFunc := func(obj any) []metric.FamilyInterface {
+		o, err := meta.Accessor(obj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []metric.FamilyInterface{&metric.Family{
+			Name: "kube_test_info",
+			Metrics: []*metric.Metric{{
+				LabelKeys:   []string{"namespace", "name"},
+				LabelValues: []string{o.GetNamespace(), o.GetName()},
+				Value:       1,
+			}},
+		}}
+	}
+	ms := NewMetricsStore([]string{"Test info."}, genFunc)
+
+	for _, name := range []string{"a", "b"} {
+		if err := ms.Add(&v1.Service{Name: name, Namespace: "ns"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out := strings.Builder{}
+	if err := NewMetricsWriter("test", ms).WriteAll(&out); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a", "b"} {
+		if !strings.Contains(out.String(), fmt.Sprintf(`name="%s"`, name)) {
+			t.Fatalf("expected metrics for UID-less object %q, got %q", name, out.String())
+		}
+	}
+
+	// Deleting one UID-less object must not drop the other.
+	if err := ms.Delete(&v1.Service{Name: "a", Namespace: "ns"}); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := NewMetricsWriter("test", ms).WriteAll(&out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), `name="a"`) {
+		t.Fatalf("expected UID-less object a to be deleted, got %q", out.String())
+	}
+	if !strings.Contains(out.String(), `name="b"`) {
+		t.Fatalf("expected UID-less object b to survive the delete of a, got %q", out.String())
+	}
+}
+
+// A delete event carrying no UID resolves to the namespace/name fallback key,
+// so it cannot drop an object stored under its real UID nor an unrelated
+// UID-less object. The stale entry a missed delete leaves behind is handled
+// by the series deduplication in WriteAll.
+func TestDeleteWithMissingUIDDoesNotDeleteUnrelatedObjects(t *testing.T) {
+	genFunc := func(obj any) []metric.FamilyInterface {
+		o, err := meta.Accessor(obj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []metric.FamilyInterface{&metric.Family{
+			Name: "kube_test_info",
+			Metrics: []*metric.Metric{{
+				LabelKeys:   []string{"namespace", "name"},
+				LabelValues: []string{o.GetNamespace(), o.GetName()},
+				Value:       1,
+			}},
+		}}
+	}
+	ms := NewMetricsStore([]string{"Test info."}, genFunc)
+
+	if err := ms.Add(&v1.Service{UID: "uid-1", Name: "real", Namespace: "ns"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.Add(&v1.Service{Name: "uidless", Namespace: "ns"}); err != nil {
+		t.Fatal(err)
+	}
+	// The delete event for "real" lost the UID; it must not match either entry.
+	if err := ms.Delete(&v1.Service{Name: "real", Namespace: "ns"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := strings.Builder{}
+	if err := NewMetricsWriter("test", ms).WriteAll(&out); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"real", "uidless"} {
+		if !strings.Contains(out.String(), fmt.Sprintf(`name="%s"`, name)) {
+			t.Fatalf("expected object %q to survive a UID-less delete, got %q", name, out.String())
+		}
+	}
+}
+
+// Replace must apply the same namespace/name fallback as Add and Delete, so a
+// relist evicts UID-less objects that are gone and keeps the ones still listed.
+func TestReplaceWithMissingUID(t *testing.T) {
+	ms := NewMetricsStore([]string{}, func(_ any) []metric.FamilyInterface { return nil })
+
+	for _, name := range []string{"keep", "drop"} {
+		if err := ms.Add(&v1.Service{Name: name, Namespace: "ns"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ms.Replace([]any{&v1.Service{Name: "keep", Namespace: "ns"}}, "1"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[types.UID]struct{}{}
+	ms.metrics.Range(func(key, _ any) bool {
+		got[key.(types.UID)] = struct{}{}
+		return true
+	})
+	want := map[types.UID]struct{}{"ns/keep": {}}
+	if !maps.Equal(got, want) {
+		t.Fatalf("expected store keys %v, got %v", want, got)
+	}
+}
+
 func TestMetricsStoreResourceVersion(t *testing.T) {
 	ms := NewMetricsStore([]string{}, func(_ any) []metric.FamilyInterface { return nil })
 

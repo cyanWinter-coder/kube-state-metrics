@@ -42,6 +42,42 @@ func TestFamilyString(t *testing.T) {
 	}
 }
 
+// The metrics store deduplicates series on the rendered text: it assumes a
+// family renders as one newline-terminated line per metric, each starting
+// with the family name, with the value separated from the labels by the last
+// space on the line. This test pins that contract.
+func TestFamilyRendersOneSeriesPerLine(t *testing.T) {
+	f := Family{
+		Name: "kube_pod_status_ready",
+		Metrics: []*Metric{
+			{
+				LabelKeys:   []string{"namespace", "pod", "condition"},
+				LabelValues: []string{"default", "pod-a", "true"},
+				Value:       1,
+			},
+			{
+				LabelKeys:   []string{"namespace", "pod", "condition"},
+				LabelValues: []string{"default", "pod-a", "false"},
+				Value:       0,
+			},
+		},
+	}
+
+	got := string(f.ByteSlice())
+	if !strings.HasSuffix(got, "\n") {
+		t.Fatalf("expected every series line to be newline-terminated, got %q", got)
+	}
+	lines := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected one line per metric, got %d lines in %q", len(lines), got)
+	}
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "kube_pod_status_ready{") {
+			t.Fatalf("expected each series line to start with the family name, got %q", line)
+		}
+	}
+}
+
 func BenchmarkMetricWrite(b *testing.B) {
 	tests := []struct {
 		testName       string
